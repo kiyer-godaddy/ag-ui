@@ -14,12 +14,39 @@
  * ```
  */
 
-import { AbstractAgent } from "@ag-ui/client";
-import { Observable, EMPTY } from "rxjs";
+import { AbstractAgent, EventType } from "@ag-ui/client";
+import { Observable, type Subscriber } from "rxjs";
 import type { BaseEvent, RunAgentInput } from "@ag-ui/core";
 
-import { DEFAULT_MODEL, ENV } from "./config";
+import { DEFAULT_MODEL, ENV, STATE_MANAGEMENT_TOOL_NAME } from "./config";
 import type { OpenAIAgentsAdapterConfig, ProcessedEvent } from "./types";
+import { messagesToSdkInput, outputToString } from "./utils";
+import {
+  StreamContext,
+  buildMessagesSnapshot,
+  closeOpenBlocks,
+  handleAgentUpdatedStreamEvent,
+  handleRawModelStreamEvent,
+  handleRunItemStreamEvent,
+} from "./handlers";
+
+/**
+ * Lazily imported SDK surface. We import dynamically so the package can be
+ * consumed even when `@openai/agents` is only a peer dependency, and so unit
+ * tests can mock the module at the boundary.
+ */
+interface OpenAIAgentsModule {
+  Agent: new <T = unknown>(config: Record<string, unknown>) => unknown;
+  run: (
+    agent: unknown,
+    input: unknown,
+    options: { stream: true },
+  ) => Promise<AsyncIterable<unknown>>;
+  setDefaultOpenAIClient?: (client: unknown) => void;
+  setDefaultOpenAIKey?: (key: string) => void;
+  setOpenAIAPI?: (value: "chat_completions" | "responses") => void;
+  setTracingDisabled?: (disabled: boolean) => void;
+}
 
 /**
  * Error thrown when the adapter cannot construct a valid OpenAI client.
@@ -36,6 +63,9 @@ export class OpenAIAgentsAdapter extends AbstractAgent {
   private static readonly DEFAULT_STATE_TTL_MS = 30 * 60 * 1000;
 
   protected config: OpenAIAgentsAdapterConfig;
+
+  /** Whether the global SDK provider has been configured by this adapter. */
+  private providerConfigured = false;
 
   constructor(config: OpenAIAgentsAdapterConfig = {}) {
     super(config);
@@ -61,13 +91,14 @@ export class OpenAIAgentsAdapter extends AbstractAgent {
 
   /**
    * Resolve the effective API key: explicit config > env.
-   * Throws `OpenAIAgentsConfigError` when no key is available.
+   * Throws `OpenAIAgentsConfigError` when no key is available and no
+   * preconfigured `openAIClient` was supplied.
    */
-  protected resolveApiKey(): string {
+  protected resolveApiKey(): string | undefined {
     const key =
       this.config.apiKey ??
       (typeof process !== "undefined" ? process.env?.[ENV.API_KEY] : undefined);
-    if (!key) {
+    if (!key && !this.config.openAIClient) {
       throw new OpenAIAgentsConfigError(
         `OpenAI API key is required. Set the ${ENV.API_KEY} environment variable or pass \`apiKey\` to the adapter config.`,
       );
@@ -97,8 +128,174 @@ export class OpenAIAgentsAdapter extends AbstractAgent {
     }
   }
 
-  // Phase 1 stub: full streaming implementation lands in Phase 2.
-  run(_input: RunAgentInput): Observable<BaseEvent> {
-    return EMPTY as unknown as Observable<ProcessedEvent>;
+  /**
+   * Configure the global SDK provider for an OpenAI-compatible endpoint
+   * (e.g. LiteLLM). Idempotent — only runs once per adapter instance.
+   *
+   * NOTE: `setDefaultOpenAIClient` / `setOpenAIAPI` / `setTracingDisabled` are
+   * process-global SDK settings. This adapter sets them when a custom
+   * `baseURL`/`openAIClient` is configured. If a host process uses multiple
+   * SDK configurations simultaneously, prefer constructing a single shared
+   * `openAIClient` and passing it via `openAIClient` (the SDK will use it as
+   * the default without additional global calls).
+   */
+  protected async configureProvider(mod: OpenAIAgentsModule): Promise<void> {
+    if (this.providerConfigured) return;
+    this.validateConfig();
+
+    if (this.config.openAIClient) {
+      // Caller supplied a fully-configured client; let the SDK use it.
+      mod.setDefaultOpenAIClient?.(this.config.openAIClient);
+      mod.setTracingDisabled?.(true);
+      this.providerConfigured = true;
+      return;
+    }
+
+    const baseURL = this.resolveBaseUrl();
+    if (baseURL) {
+      // OpenAI-compatible endpoint (LiteLLM). Most such proxies do not support
+      // the Responses API, so switch to Chat Completions mode and disable
+      // tracing (no platform.openai.com key for trace export).
+      const key = this.resolveApiKey();
+      const OpenAI = (await import("openai")).default;
+      const client = new OpenAI({ apiKey: key, baseURL });
+      mod.setDefaultOpenAIClient?.(client);
+      mod.setOpenAIAPI?.("chat_completions");
+      mod.setTracingDisabled?.(true);
+      this.providerConfigured = true;
+      return;
+    }
+
+    // Default cloud path: set the key so the SDK can authenticate.
+    // resolveApiKey() throws when no key is available and no openAIClient is
+    // set; the openAIClient branch above already returned, so here it is
+    // defined.
+    const key = this.resolveApiKey() as string;
+    mod.setDefaultOpenAIKey?.(key);
+    this.providerConfigured = true;
+  }
+
+  /**
+   * Build the OpenAI Agents JS `Agent` from adapter config + run input.
+   *
+   * Phase 2 wires instructions + model only; tool conversion (including the
+   * `ag_ui_update_state` state tool) lands in Phase 3.
+   */
+  protected buildAgent(mod: OpenAIAgentsModule, input: RunAgentInput): unknown {
+    const instructions =
+      this.config.instructions ??
+      input.context?.find((c) => typeof c === "object" && c)?.description ??
+      "You are a helpful assistant.";
+
+    const agentConfig: Record<string, unknown> = {
+      name: this.config.agentId ?? "ag-ui-openai-agent",
+      instructions,
+      model: this.resolveModel(),
+      tools: [],
+    };
+
+    return new mod.Agent(agentConfig);
+  }
+
+  run(input: RunAgentInput): Observable<BaseEvent> {
+    return new Observable<ProcessedEvent>((subscriber) => {
+      void this.runAsync(input, subscriber).catch((error) => {
+        if (!subscriber.closed) subscriber.error(error);
+      });
+    });
+  }
+
+  private async runAsync(
+    input: RunAgentInput,
+    subscriber: Subscriber<ProcessedEvent>,
+  ): Promise<void> {
+    const threadId = input.threadId ?? this.threadId;
+    const runId = input.runId ?? this.config.agentId ?? "run";
+
+    this.validateConfig();
+    if (!this.config.openAIClient) this.resolveApiKey();
+
+    const mod = (await import("@openai/agents")) as unknown as OpenAIAgentsModule;
+    await this.configureProvider(mod);
+
+    const agent = this.buildAgent(mod, input);
+    const sdkInput = messagesToSdkInput(input.messages ?? []);
+
+    const ctx = new StreamContext(runId);
+
+    try {
+      if (input.parentRunId) {
+        console.debug(
+          `[OpenAIAgentsAdapter] Run ${runId.slice(0, 8)} branched from ${input.parentRunId.slice(0, 8)}`,
+        );
+      }
+
+      subscriber.next({
+        type: EventType.RUN_STARTED,
+        threadId,
+        runId,
+        ...(input.parentRunId ? { parentRunId: input.parentRunId } : {}),
+      });
+
+      const stream = (await mod.run(agent, sdkInput, { stream: true })) as AsyncIterable<any>;
+
+      for await (const ev of stream) {
+        if (subscriber.closed) break;
+        const emitted = dispatchStreamEvent(ev, ctx);
+        for (const e of emitted) subscriber.next(e as ProcessedEvent);
+      }
+
+      // Close any open message / reasoning blocks at end-of-stream.
+      for (const e of closeOpenBlocks(ctx)) subscriber.next(e as ProcessedEvent);
+
+      subscriber.next({
+        type: EventType.MESSAGES_SNAPSHOT,
+        messages: buildMessagesSnapshot(input.messages ?? []),
+      });
+
+      subscriber.next({
+        type: EventType.RUN_FINISHED,
+        threadId,
+        runId,
+        outcome: { type: "success" },
+      });
+      subscriber.complete();
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error);
+      if (!subscriber.closed) {
+        subscriber.next({
+          type: EventType.RUN_ERROR,
+          message,
+        });
+        subscriber.complete();
+      }
+    }
   }
 }
+
+/**
+ * Dispatch a single SDK stream event to the appropriate handler.
+ *
+ * `RunStreamEvent` is a discriminated union on `type`:
+ *  - `raw_model_stream_event`   → `handleRawModelStreamEvent`
+ *  - `run_item_stream_event`     → `handleRunItemStreamEvent`
+ *  - `agent_updated_stream_event`→ `handleAgentUpdatedStreamEvent`
+ */
+function dispatchStreamEvent(ev: any, ctx: StreamContext): BaseEvent[] {
+  if (!ev || typeof ev !== "object") return [];
+  switch (ev.type) {
+    case "raw_model_stream_event":
+      return handleRawModelStreamEvent(ev.data, ctx);
+    case "run_item_stream_event":
+      return handleRunItemStreamEvent(ev.name, ev.item, ctx);
+    case "agent_updated_stream_event":
+      return handleAgentUpdatedStreamEvent(ev.agent);
+    default:
+      return [];
+  }
+}
+
+// Re-export helpers used by tests so they don't have to reach into internals.
+export { StreamContext, messagesToSdkInput, outputToString };
+export { STATE_MANAGEMENT_TOOL_NAME };
