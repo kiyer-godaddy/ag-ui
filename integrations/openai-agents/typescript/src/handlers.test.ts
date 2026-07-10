@@ -392,3 +392,95 @@ describe("handlers — message snapshot merging (Phase 4)", () => {
     expect(ctx.messages).toEqual([]);
   });
 });
+
+describe("handlers — frontend-tool HITL halt (Phase 5)", () => {
+  it("halts on a frontend tool: emits START/ARGS/END, sets halt, pushes interrupt, no RESULT", () => {
+    const ctx = new StreamContext("run-1");
+    ctx.frontendToolNames = new Set(["get_weather"]);
+
+    const e = handleRunItemStreamEvent("tool_called", {
+      rawItem: { callId: "call_fw", name: "get_weather", arguments: '{"city":"SF"}' },
+    }, ctx);
+
+    expect(e).toEqual([
+      { type: EventType.TOOL_CALL_START, toolCallId: "call_fw", toolCallName: "get_weather" },
+      { type: EventType.TOOL_CALL_ARGS, toolCallId: "call_fw", delta: '{"city":"SF"}' },
+      { type: EventType.TOOL_CALL_END, toolCallId: "call_fw" },
+    ]);
+    expect(ctx.halt).toBe(true);
+    expect(ctx.openToolCalls.has("call_fw")).toBe(false);
+    expect(ctx.interrupts).toEqual([
+      { id: "call_fw", reason: "frontend_tool", toolCallId: "call_fw", metadata: { toolName: "get_weather" } },
+    ]);
+  });
+
+  it("closes an open text message before the frontend tool call", () => {
+    const ctx = new StreamContext("run-1");
+    ctx.frontendToolNames = new Set(["get_weather"]);
+    handleRawModelStreamEvent({ type: "output_text_delta", delta: "Let me check" }, ctx);
+
+    const e = handleRunItemStreamEvent("tool_called", {
+      rawItem: { callId: "call_fw", name: "get_weather", arguments: '{"city":"SF"}' },
+    }, ctx);
+
+    // First event closes the streaming text message.
+    expect(e[0]).toEqual({ type: EventType.TEXT_MESSAGE_END, messageId: "run-1" });
+    expect(ctx.messageOpen).toBe(false);
+    // Then the tool-call lifecycle.
+    expect(e[1]).toMatchObject({ type: EventType.TOOL_CALL_START, toolCallId: "call_fw" });
+    expect(ctx.halt).toBe(true);
+  });
+
+  it("does not halt for a non-frontend tool", () => {
+    const ctx = new StreamContext("run-1");
+    ctx.frontendToolNames = new Set(["get_weather"]);
+
+    handleRunItemStreamEvent("tool_called", {
+      rawItem: { callId: "call_be", name: "backend_lookup", arguments: "{}" },
+    }, ctx);
+
+    expect(ctx.halt).toBe(false);
+    expect(ctx.interrupts).toEqual([]);
+    // A backend tool is tracked as open (its tool_output follows in-run).
+    expect(ctx.openToolCalls.has("call_be")).toBe(true);
+  });
+
+  it("records the frontend tool call against the assistant message + flushes it", () => {
+    const ctx = new StreamContext("run-1");
+    ctx.frontendToolNames = new Set(["get_weather"]);
+    handleRawModelStreamEvent({ type: "output_text_delta", delta: "Sure" }, ctx);
+    handleRunItemStreamEvent("tool_called", {
+      rawItem: { callId: "call_fw", name: "get_weather", arguments: '{"city":"SF"}' },
+    }, ctx);
+    // Halt flushes the pending assistant message.
+    expect(ctx.messages).toHaveLength(1);
+    const assistant = ctx.messages[0] as any;
+    expect(assistant.role).toBe("assistant");
+    expect(assistant.content).toBe("Sure");
+    expect(assistant.toolCalls).toEqual([
+      { id: "call_fw", type: "function", function: { name: "get_weather", arguments: '{"city":"SF"}' } },
+    ]);
+  });
+
+  it("uses buffered streamed args for the frontend tool call", () => {
+    const ctx = new StreamContext("run-1");
+    ctx.frontendToolNames = new Set(["get_weather"]);
+    handleRawModelStreamEvent(
+      { type: "model", event: { type: "response.function_call_arguments.delta", item_id: "call_fw", delta: '{"city":' } },
+      ctx,
+    );
+    handleRawModelStreamEvent(
+      { type: "model", event: { type: "response.function_call_arguments.delta", item_id: "call_fw", delta: '"SF"}' } },
+      ctx,
+    );
+    const e = handleRunItemStreamEvent("tool_called", {
+      rawItem: { callId: "call_fw", name: "get_weather", arguments: "" },
+    }, ctx);
+    expect(e).toEqual([
+      { type: EventType.TOOL_CALL_START, toolCallId: "call_fw", toolCallName: "get_weather" },
+      { type: EventType.TOOL_CALL_ARGS, toolCallId: "call_fw", delta: '{"city":"SF"}' },
+      { type: EventType.TOOL_CALL_END, toolCallId: "call_fw" },
+    ]);
+    expect(ctx.halt).toBe(true);
+  });
+});

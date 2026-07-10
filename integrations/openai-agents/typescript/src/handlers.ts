@@ -9,6 +9,7 @@
 import { EventType } from "@ag-ui/client";
 import type {
   BaseEvent,
+  Interrupt,
   Message,
 } from "@ag-ui/core";
 
@@ -57,6 +58,24 @@ export class StreamContext {
   /** toolCallIds produced by the state-management tool (intercepted, not forwarded). */
   readonly stateToolCallIds = new Set<string>();
 
+  /**
+   * Names of AG-UI frontend tools (from `input.tools`). A `tool_called` whose
+   * name is in this set is a frontend tool: the adapter emits `TOOL_CALL_*`,
+   * halts the run (sets `halt`), and lets the frontend execute it. Set by the
+   * adapter before consuming the stream. (Phase 5.)
+   */
+  frontendToolNames: Set<string> = new Set();
+
+  /** Set to `true` when the run must stop consuming the SDK stream — i.e. a
+   *  frontend tool was called and the frontend must execute it. (Phase 5.) */
+  halt = false;
+
+  /**
+   * Interrupts raised this run (one per frontend-tool halt), surfaced as the
+   * `RUN_FINISHED` `outcome: { type: "interrupt", interrupts }`. (Phase 5.)
+   */
+  readonly interrupts: Interrupt[] = [];
+
   /** Shared application state, seeded from `input.state` and evolved as the
    *  model calls `ag_ui_update_state` (replace semantics). */
   currentState: unknown;
@@ -73,6 +92,17 @@ export class StreamContext {
     initialState?: unknown,
   ) {
     this.currentState = initialState ?? null;
+  }
+
+  /** Record a frontend-tool interrupt and arm the halt flag. (Phase 5.) */
+  addInterrupt(toolCallId: string, toolName: string): void {
+    this.interrupts.push({
+      id: toolCallId,
+      reason: "frontend_tool",
+      toolCallId,
+      metadata: { toolName },
+    });
+    this.halt = true;
   }
 
   /**
@@ -373,13 +403,54 @@ function handleToolCalled(item: any, ctx: StreamContext): BaseEvent[] {
 
   // If args streamed before the item, emit them now as a single ARGS delta.
   const buffered = ctx.toolCallArgs.get(callId);
-  ctx.openToolCalls.add(callId);
-
   const effectiveArgs =
     buffered ??
     (typeof raw.arguments === "string" && raw.arguments.length > 0
       ? raw.arguments
       : "");
+
+  const isFrontendTool =
+    toolName != null && ctx.frontendToolNames.has(toolName);
+
+  // Frontend tools are executed by the frontend, not the SDK. Close any open
+  // text message so the stream ends in a valid state before the tool call,
+  // emit the TOOL_CALL_* lifecycle, record the call, then halt the run with
+  // an interrupt — do NOT emit TOOL_CALL_RESULT (the frontend provides it in a
+  // subsequent run) and do NOT track the call as "open" (no SDK tool_output
+  // will follow for it). (Phase 5.)
+  if (isFrontendTool) {
+    if (ctx.messageOpen) {
+      events.push({
+        type: EventType.TEXT_MESSAGE_END,
+        messageId: ctx.currentMessageId!,
+      });
+      ctx.messageOpen = false;
+    }
+    events.push({
+      type: EventType.TOOL_CALL_START,
+      toolCallId: callId,
+      toolCallName: toolName!,
+    });
+    if (effectiveArgs) {
+      events.push({
+        type: EventType.TOOL_CALL_ARGS,
+        toolCallId: callId,
+        delta: effectiveArgs,
+      });
+    }
+    events.push({
+      type: EventType.TOOL_CALL_END,
+      toolCallId: callId,
+    });
+    ctx.recordAssistantToolCall(callId, toolName!, effectiveArgs);
+    ctx.flushPendingAssistant();
+    ctx.addInterrupt(callId, toolName!);
+    return events;
+  }
+
+  // Backend / stub-executed tool: the SDK runs the stub `execute` and emits a
+  // tool_output run_item, so track the call as open for the in-run result.
+  ctx.openToolCalls.add(callId);
 
   events.push({
     type: EventType.TOOL_CALL_START,

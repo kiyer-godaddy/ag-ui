@@ -377,6 +377,159 @@ describe("OpenAIAgentsAdapter — run lifecycle", () => {
   });
 });
 
+describe("OpenAIAgentsAdapter — HITL halt + resume (Phase 5)", () => {
+  const origEnv = { ...process.env };
+  beforeEach(() => {
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.OPENAI_BASE_URL;
+    delete process.env.OPENAI_MODEL;
+    eventsRef.events = [];
+    eventsRef.throwErr = undefined;
+    lastRun = { agentConfig: {}, input: undefined, providerCalls: {} } as any;
+  });
+  afterEach(() => {
+    process.env = { ...origEnv };
+  });
+
+  it("halts on a frontend tool and finishes with an interrupt outcome", async () => {
+    eventsRef.events = [
+      { type: "raw_model_stream_event", data: { type: "output_text_delta", delta: "Let me check the weather" } },
+      {
+        type: "run_item_stream_event",
+        name: "tool_called",
+        item: { rawItem: { callId: "call_fw", name: "get_weather", arguments: '{"city":"SF"}' } },
+      },
+      // These should NEVER be reached — the adapter breaks the loop on halt.
+      { type: "raw_model_stream_event", data: { type: "output_text_delta", delta: "AFTER HALT" } },
+    ];
+    process.env.OPENAI_API_KEY = "sk-test";
+
+    const adapter = new OpenAIAgentsAdapter({ model: "gpt-5" });
+    const events = await collectEvents(
+      adapter,
+      baseInput({
+        tools: [{ name: "get_weather", description: "w", parameters: {} }],
+        state: null,
+      }),
+    );
+
+    const types = events.map((e) => e.type);
+    expect(types).toContain(EventType.TOOL_CALL_START);
+    expect(types).toContain(EventType.TOOL_CALL_END);
+    expect(types).not.toContain(EventType.TOOL_CALL_RESULT);
+
+    // The "AFTER HALT" delta was never consumed.
+    const contentEvents = events.filter((e) => e.type === EventType.TEXT_MESSAGE_CONTENT) as any[];
+    expect(contentEvents.map((e) => e.delta)).toEqual(["Let me check the weather"]);
+
+    const finished = events.find((e) => e.type === EventType.RUN_FINISHED) as any;
+    expect(finished.outcome).toEqual({
+      type: "interrupt",
+      interrupts: [
+        { id: "call_fw", reason: "frontend_tool", toolCallId: "call_fw", metadata: { toolName: "get_weather" } },
+      ],
+    });
+  });
+
+  it("resumes: a tool-result message is fed back as a function_call_result input item", async () => {
+    eventsRef.events = [];
+    process.env.OPENAI_API_KEY = "sk-test";
+
+    const adapter = new OpenAIAgentsAdapter({ model: "gpt-5" });
+    await collectEvents(
+      adapter,
+      baseInput({
+        messages: [
+          { id: "u1", role: "user", content: "What's the weather?" } as any,
+          {
+            id: "call_fw",
+            role: "tool",
+            toolCallId: "call_fw",
+            content: "sunny",
+          } as any,
+        ],
+        tools: [{ name: "get_weather", description: "w", parameters: {} }],
+        state: null,
+      }),
+    );
+
+    expect(lastRun.input).toEqual(
+      expect.arrayContaining([
+        { role: "user", content: "What's the weather?" },
+        {
+          type: "function_call_result",
+          callId: "call_fw",
+          name: "call_fw",
+          output: "sunny",
+          status: "completed",
+        },
+      ]),
+    );
+
+    // Resumed run completes successfully (no interrupt).
+    // (lastRun.input was the SDK input; outcome is asserted via the events in
+    // the halt test; here we just confirm the reconstruction path.)
+  });
+
+  it("hydrates state from the in-memory store across runs on the same thread", async () => {
+    // Run 1: state evolves via ag_ui_update_state and is persisted.
+    eventsRef.events = [
+      {
+        type: "run_item_stream_event",
+        name: "tool_called",
+        item: {
+          rawItem: {
+            callId: "call_s",
+            name: "ag_ui_update_state",
+            arguments: JSON.stringify({ state: { count: 42 } }),
+          },
+        },
+      },
+      { type: "run_item_stream_event", name: "tool_output", item: { rawItem: { callId: "call_s" }, output: "ok" } },
+    ];
+    process.env.OPENAI_API_KEY = "sk-test";
+
+    const adapter = new OpenAIAgentsAdapter({ model: "gpt-5" });
+    await collectEvents(adapter, baseInput({ threadId: "thread-x", state: { count: 0 } }));
+
+    // Run 2: no state sent — should hydrate { count: 42 } from the store.
+    eventsRef.events = [];
+    const events = await collectEvents(
+      adapter,
+      baseInput({ threadId: "thread-x", state: null }),
+    );
+
+    const snapshots = events.filter((e) => e.type === EventType.STATE_SNAPSHOT) as any[];
+    expect(snapshots.length).toBeGreaterThan(0);
+    expect(snapshots[0].snapshot).toEqual({ count: 42 });
+  });
+
+  it("talks to an injected custom RunStateStore (the DDB/S3 extension seam)", async () => {
+    const calls: string[] = [];
+    const fakeStore = {
+      get: async (threadId: string) => {
+        calls.push(`get:${threadId}`);
+        return undefined;
+      },
+      set: async (threadId: string, _state: unknown) => {
+        calls.push(`set:${threadId}`);
+      },
+      delete: async (threadId: string) => {
+        calls.push(`delete:${threadId}`);
+      },
+    };
+
+    eventsRef.events = [];
+    process.env.OPENAI_API_KEY = "sk-test";
+
+    const adapter = new OpenAIAgentsAdapter({ model: "gpt-5", runStateStore: fakeStore as any });
+    await collectEvents(adapter, baseInput({ threadId: "thread-custom", state: null }));
+
+    // The adapter consulted the store for hydration on this thread.
+    expect(calls).toContain("get:thread-custom");
+  });
+});
+
 describe("OpenAIAgentsAdapter — LiteLLM provider wiring", () => {
   const origEnv = { ...process.env };
   beforeEach(() => {

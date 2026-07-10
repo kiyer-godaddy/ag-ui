@@ -23,3 +23,5 @@ export {
   DEFAULT_MODEL,
   ENV,
 } from "./config";
+export { InMemoryRunStateStore, DEFAULT_MAX_STATES, DEFAULT_STATE_TTL_MS } from "./state";
+export type { RunStateStore } from "./state";

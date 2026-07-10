@@ -20,7 +20,8 @@ import type { BaseEvent, RunAgentInput } from "@ag-ui/core";
 
 import { DEFAULT_MODEL, ENV, STATE_MANAGEMENT_TOOL_NAME } from "./config";
 import type { OpenAIAgentsAdapterConfig, ProcessedEvent } from "./types";
-import { hasState } from "./state";
+import { hasState, InMemoryRunStateStore } from "./state";
+import type { RunStateStore } from "./state";
 import { messagesToSdkInput, outputToString } from "./utils";
 import {
   StreamContext,
@@ -62,17 +63,27 @@ export class OpenAIAgentsConfigError extends Error {
 }
 
 export class OpenAIAgentsAdapter extends AbstractAgent {
-  private static readonly DEFAULT_MAX_STATES = 1000;
-  private static readonly DEFAULT_STATE_TTL_MS = 30 * 60 * 1000;
-
   protected config: OpenAIAgentsAdapterConfig;
 
   /** Whether the global SDK provider has been configured by this adapter. */
   private providerConfigured = false;
 
+  /**
+   * Pause/resume persistence for the shared `currentState` across HITL halts.
+   * Defaults to an in-memory store; users can inject a durable backend
+   * (DynamoDB / S3 / Redis / etc.) via `config.runStateStore`.
+   */
+  private readonly runStateStore: RunStateStore;
+
   constructor(config: OpenAIAgentsAdapterConfig = {}) {
     super(config);
     this.config = config;
+    this.runStateStore =
+      config.runStateStore ??
+      new InMemoryRunStateStore({
+        maxStates: config.maxStates,
+        ttlMs: config.stateTtlMs,
+      });
   }
 
   public clone(): OpenAIAgentsAdapter {
@@ -229,7 +240,24 @@ export class OpenAIAgentsAdapter extends AbstractAgent {
     const agent = this.buildAgent(mod, input);
     const sdkInput = messagesToSdkInput(input.messages ?? []);
 
-    const ctx = new StreamContext(runId, input.state);
+    // Names of AG-UI frontend tools — a `tool_called` for one of these halts
+    // the run so the frontend can execute it. (Phase 5.)
+    const frontendToolNames = new Set<string>(
+      (input.tools ?? [])
+        .map((t) => t?.name)
+        .filter((n): n is string => typeof n === "string"),
+    );
+
+    // Hydrate shared state: prefer the run's own state; fall back to any state
+    // stashed for this thread across a prior HITL pause. (Phase 5.)
+    let effectiveState: unknown = input.state;
+    if (!hasState(effectiveState)) {
+      const stashed = await this.runStateStore.get(threadId);
+      if (stashed !== undefined) effectiveState = stashed;
+    }
+
+    const ctx = new StreamContext(runId, effectiveState);
+    ctx.frontendToolNames = frontendToolNames;
 
     try {
       if (input.parentRunId) {
@@ -247,10 +275,10 @@ export class OpenAIAgentsAdapter extends AbstractAgent {
 
       // Announce the initial shared state so the frontend can hydrate. Mirrors
       // the claude-agent-sdk behaviour: only emit when state is meaningful.
-      if (hasState(input.state)) {
+      if (hasState(effectiveState)) {
         subscriber.next({
           type: EventType.STATE_SNAPSHOT,
-          snapshot: input.state,
+          snapshot: effectiveState,
         });
       }
 
@@ -260,6 +288,9 @@ export class OpenAIAgentsAdapter extends AbstractAgent {
         if (subscriber.closed) break;
         const emitted = dispatchStreamEvent(ev, ctx);
         for (const e of emitted) subscriber.next(e as ProcessedEvent);
+        // A frontend tool was called: stop consuming the SDK stream so the
+        // frontend can execute it and resume in a subsequent run. (Phase 5.)
+        if (ctx.halt) break;
       }
 
       // Close any open message / reasoning blocks at end-of-stream.
@@ -270,11 +301,19 @@ export class OpenAIAgentsAdapter extends AbstractAgent {
         messages: buildMessagesSnapshot(input.messages ?? [], ctx.messages),
       });
 
+      // Persist the evolved shared state for this thread so a resumed run can
+      // hydrate it even if the frontend doesn't resend `state`. (Phase 5.)
+      if (hasState(ctx.currentState)) {
+        await this.runStateStore.set(threadId, ctx.currentState);
+      }
+
       subscriber.next({
         type: EventType.RUN_FINISHED,
         threadId,
         runId,
-        outcome: { type: "success" },
+        ...(ctx.interrupts.length > 0
+          ? { outcome: { type: "interrupt", interrupts: ctx.interrupts } }
+          : { outcome: { type: "success" } }),
       });
       subscriber.complete();
     } catch (error) {

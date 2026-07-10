@@ -2,14 +2,17 @@
  * Tool conversion for the OpenAI Agents JS adapter.
  *
  * AG-UI tools are *frontend* tools: the model calls them, the adapter emits
- * `TOOL_CALL_*` events, and the *frontend* executes them and returns the
- * result in a subsequent run. The adapter therefore never executes them
- * server-side — the SDK `FunctionTool`s created here carry a stub `execute`
- * that returns a placeholder so a single run does not hang.
+ * `TOOL_CALL_*` events, halts the run with an `interrupt` outcome, and the
+ * *frontend* executes them and returns the result in a subsequent run (fed
+ * back to the SDK as a `function_call_result` input item). The adapter
+ * therefore never executes frontend tools server-side.
  *
- * The halt-on-`tool_called` + frontend-result-injection semantics (the real
- * AG-UI tool-execution flow) land in Phase 5 (HITL). Until then, tool calls
- * resolve to the placeholder within the same run.
+ * The SDK `FunctionTool`s created here carry a stub `execute` that returns a
+ * placeholder. In the normal Phase 5 HITL flow the adapter halts on
+ * `tool_called` *before* the stub runs, so the stub is never invoked — it
+ * exists purely as a safety net so a single run doesn't hang if a tool is
+ * somehow executed server-side (e.g. a non-frontend/backend tool, or a caller
+ * that consumes the adapter without the halt path).
  *
  * State management mirrors the claude-agent-sdk pattern: an injected
  * `ag_ui_update_state` function tool the model calls to mutate the shared

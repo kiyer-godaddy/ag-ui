@@ -22,6 +22,8 @@ import type {
   CustomEvent,
 } from "@ag-ui/core";
 
+import type { RunStateStore } from "./state";
+
 /**
  * Configuration for `OpenAIAgentsAdapter`.
  *
@@ -70,6 +72,14 @@ export type OpenAIAgentsAdapterConfig = AgentConfig & {
 
   /** TTL in ms for idle RunState entries. Default: 30 minutes. */
   stateTtlMs?: number;
+
+  /**
+   * Custom RunState persistence for the shared `currentState` across a HITL
+   * pause/resume. Defaults to an in-memory store (TTL + LRU). Implement the
+   * `RunStateStore` interface over DynamoDB / S3 / Redis / etc. and inject it
+   * here to durable-persist paused-run state across processes.
+   */
+  runStateStore?: RunStateStore;
 };
 
 /**
