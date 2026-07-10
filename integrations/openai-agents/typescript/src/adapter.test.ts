@@ -69,6 +69,16 @@ vi.mock("@openai/agents", () => {
         lastRun.agentConfig = cfg;
       }
     },
+    tool: (options: Record<string, unknown>) => ({
+      // Return a plain object echoing the conversion options so tests can
+      // assert what the adapter passed to the SDK `tool()` factory.
+      name: options.name,
+      description: options.description,
+      parameters: options.parameters,
+      strict: options.strict,
+      execute: options.execute,
+      __mockTool: true,
+    }),
     run: async (_agent: unknown, input: unknown, _opts: { stream: true }) => {
       lastRun.input = input;
       if (eventsRef.throwErr) throw eventsRef.throwErr;
@@ -220,6 +230,46 @@ describe("OpenAIAgentsAdapter — run lifecycle", () => {
       model: "gpt-5-mini",
       instructions: "You are a pirate",
     });
+  });
+
+  it("wires converted tools + ag_ui_update_state into the agent when state is present", async () => {
+    eventsRef.events = [];
+    process.env.OPENAI_API_KEY = "sk-test";
+
+    const adapter = new OpenAIAgentsAdapter({ model: "gpt-5" });
+    await collectEvents(
+      adapter,
+      baseInput({
+        tools: [
+          { name: "get_weather", description: "Get weather", parameters: {} },
+        ],
+        state: { count: 1 },
+      }),
+    );
+
+    const tools = lastRun.agentConfig.tools as unknown[];
+    expect(Array.isArray(tools)).toBe(true);
+    expect(tools).toHaveLength(2);
+    expect(tools[0]).toMatchObject({ name: "get_weather", __mockTool: true });
+    expect(tools[1]).toMatchObject({ name: "ag_ui_update_state", __mockTool: true });
+  });
+
+  it("wires no state tool when state is absent", async () => {
+    eventsRef.events = [];
+    process.env.OPENAI_API_KEY = "sk-test";
+
+    const adapter = new OpenAIAgentsAdapter({ model: "gpt-5" });
+    await collectEvents(
+      adapter,
+      baseInput({
+        tools: [{ name: "only_tool", description: "x", parameters: {} }],
+        state: null,
+      }),
+    );
+
+    const tools = lastRun.agentConfig.tools as unknown[];
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({ name: "only_tool" });
   });
 });
 

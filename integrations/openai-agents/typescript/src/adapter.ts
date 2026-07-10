@@ -29,6 +29,7 @@ import {
   handleRawModelStreamEvent,
   handleRunItemStreamEvent,
 } from "./handlers";
+import { buildTools } from "./tools";
 
 /**
  * Lazily imported SDK surface. We import dynamically so the package can be
@@ -37,6 +38,7 @@ import {
  */
 interface OpenAIAgentsModule {
   Agent: new <T = unknown>(config: Record<string, unknown>) => unknown;
+  tool?: (options: Record<string, unknown>) => unknown;
   run: (
     agent: unknown,
     input: unknown,
@@ -178,8 +180,11 @@ export class OpenAIAgentsAdapter extends AbstractAgent {
   /**
    * Build the OpenAI Agents JS `Agent` from adapter config + run input.
    *
-   * Phase 2 wires instructions + model only; tool conversion (including the
-   * `ag_ui_update_state` state tool) lands in Phase 3.
+   * Wires instructions + model, and converts `input.tools` (AG-UI frontend
+   * tools) into SDK `FunctionTool`s, injecting the `ag_ui_update_state`
+   * state tool when the run carries state. Tools are non-strict (JSON Schema
+   * passthrough) with stub `execute`s — the real frontend-execution flow
+   * (halt on `tool_called`, resume with the frontend result) lands in Phase 5.
    */
   protected buildAgent(mod: OpenAIAgentsModule, input: RunAgentInput): unknown {
     const instructions =
@@ -187,11 +192,13 @@ export class OpenAIAgentsAdapter extends AbstractAgent {
       input.context?.find((c) => typeof c === "object" && c)?.description ??
       "You are a helpful assistant.";
 
+    const tools = mod.tool ? buildTools(input, { tool: mod.tool }) : [];
+
     const agentConfig: Record<string, unknown> = {
       name: this.config.agentId ?? "ag-ui-openai-agent",
       instructions,
       model: this.resolveModel(),
-      tools: [],
+      tools,
     };
 
     return new mod.Agent(agentConfig);
