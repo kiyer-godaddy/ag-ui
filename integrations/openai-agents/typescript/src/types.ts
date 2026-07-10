@@ -67,6 +67,15 @@ export type OpenAIAgentsAdapterConfig = AgentConfig & {
   /** System prompt / instructions for the agent. */
   instructions?: string;
 
+  /**
+   * SDK-native backend tools (e.g. built with `@openai/agents`'s `tool()`) the
+   * agent may call and that execute server-side. These are distinct from AG-UI
+   * *frontend* tools (provided per-run via `RunAgentInput.tools`, which halt
+   * for client-side execution). Backend tools are merged into the agent
+   * alongside any frontend tools + the injected state tool.
+   */
+  tools?: unknown[];
+
   /** Max concurrent idle RunState entries kept for pause/resume. Default: 1000. */
   maxStates?: number;
 

@@ -206,11 +206,17 @@ export class OpenAIAgentsAdapter extends AbstractAgent {
 
     const tools = mod.tool ? buildTools(input, { tool: mod.tool }) : [];
 
+    // Merge any SDK-native backend tools from config (server-side execution)
+    // alongside the AG-UI frontend tools + injected state tool above.
+    const allTools = Array.isArray(this.config.tools)
+      ? [...tools, ...this.config.tools]
+      : tools;
+
     const agentConfig: Record<string, unknown> = {
       name: this.config.agentId ?? "ag-ui-openai-agent",
       instructions,
       model: this.resolveModel(),
-      tools,
+      tools: allTools,
     };
 
     return new mod.Agent(agentConfig);
