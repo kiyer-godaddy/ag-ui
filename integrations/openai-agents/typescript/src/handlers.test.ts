@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { EventType } from "@ag-ui/client";
 
+import { STATE_MANAGEMENT_TOOL_NAME } from "./config";
 import {
   StreamContext,
   handleRawModelStreamEvent,
@@ -213,5 +214,181 @@ describe("handlers — end-of-stream cleanup", () => {
     expect(out).toHaveLength(2);
     expect(out[0].id).toBe("m1");
     expect(out[1].id).toBe("m2");
+  });
+});
+
+describe("handlers — state interception (Phase 4)", () => {
+  it("intercepts ag_ui_update_state: emits STATE_SNAPSHOT, no TOOL_CALL_*", () => {
+    const ctx = new StreamContext("run-1", { count: 1 });
+    const e = handleRunItemStreamEvent("tool_called", {
+      rawItem: {
+        callId: "call_s",
+        name: STATE_MANAGEMENT_TOOL_NAME,
+        arguments: JSON.stringify({ state: { count: 2 } }),
+      },
+    }, ctx);
+
+    expect(e).toEqual([
+      { type: EventType.STATE_SNAPSHOT, snapshot: { count: 2 } },
+    ]);
+    // Not surfaced as a frontend tool call.
+    expect(ctx.openToolCalls.has("call_s")).toBe(false);
+    expect(ctx.stateToolCallIds.has("call_s")).toBe(true);
+    // Replace semantics: currentState is the new object, not merged.
+    expect(ctx.currentState).toEqual({ count: 2 });
+  });
+
+  it("uses replace semantics (model passes the complete state object)", () => {
+    const ctx = new StreamContext("run-1", { a: 1, b: 2 });
+    handleRunItemStreamEvent("tool_called", {
+      rawItem: {
+        callId: "call_s",
+        name: STATE_MANAGEMENT_TOOL_NAME,
+        arguments: JSON.stringify({ state: { a: 9 } }),
+      },
+    }, ctx);
+    // b is gone — the model's state object replaces, not merges.
+    expect(ctx.currentState).toEqual({ a: 9 });
+  });
+
+  it("does not emit a duplicate STATE_SNAPSHOT when state is unchanged", () => {
+    const ctx = new StreamContext("run-1", { count: 1 });
+    const e = handleRunItemStreamEvent("tool_called", {
+      rawItem: {
+        callId: "call_s",
+        name: STATE_MANAGEMENT_TOOL_NAME,
+        arguments: JSON.stringify({ state: { count: 1 } }),
+      },
+    }, ctx);
+    expect(e).toEqual([]);
+    expect(ctx.currentState).toEqual({ count: 1 });
+  });
+
+  it("accepts a bare state object (no `state` wrapper)", () => {
+    const ctx = new StreamContext("run-1", null);
+    const e = handleRunItemStreamEvent("tool_called", {
+      rawItem: {
+        callId: "call_s",
+        name: STATE_MANAGEMENT_TOOL_NAME,
+        arguments: JSON.stringify({ items: ["x"] }),
+      },
+    }, ctx);
+    expect(e).toEqual([{ type: EventType.STATE_SNAPSHOT, snapshot: { items: ["x"] } }]);
+  });
+
+  it("emits a state_update_error CUSTOM event on malformed JSON args", () => {
+    const ctx = new StreamContext("run-1", { count: 1 });
+    const e = handleRunItemStreamEvent("tool_called", {
+      rawItem: {
+        callId: "call_s",
+        name: STATE_MANAGEMENT_TOOL_NAME,
+        arguments: "{not json",
+      },
+    }, ctx);
+    expect(e).toHaveLength(1);
+    expect(e[0]).toMatchObject({ type: EventType.CUSTOM, name: "state_update_error" });
+    // State left unchanged.
+    expect(ctx.currentState).toEqual({ count: 1 });
+  });
+
+  it("uses buffered streamed args when present", () => {
+    const ctx = new StreamContext("run-1", { count: 0 });
+    // arg deltas stream before the tool_called run_item
+    handleRawModelStreamEvent(
+      { type: "model", event: { type: "response.function_call_arguments.delta", item_id: "call_s", delta: '{"state":' } },
+      ctx,
+    );
+    handleRawModelStreamEvent(
+      { type: "model", event: { type: "response.function_call_arguments.delta", item_id: "call_s", delta: '{"count":5}}' } },
+      ctx,
+    );
+    const e = handleRunItemStreamEvent("tool_called", {
+      rawItem: { callId: "call_s", name: STATE_MANAGEMENT_TOOL_NAME, arguments: "" },
+    }, ctx);
+    expect(e).toEqual([{ type: EventType.STATE_SNAPSHOT, snapshot: { count: 5 } }]);
+    expect(ctx.toolCallArgs.has("call_s")).toBe(false);
+  });
+
+  it("swallows the state tool's tool_output (no dangling TOOL_CALL_RESULT)", () => {
+    const ctx = new StreamContext("run-1", { count: 1 });
+    handleRunItemStreamEvent("tool_called", {
+      rawItem: {
+        callId: "call_s",
+        name: STATE_MANAGEMENT_TOOL_NAME,
+        arguments: JSON.stringify({ state: { count: 2 } }),
+      },
+    }, ctx);
+    const out = handleRunItemStreamEvent("tool_output", {
+      rawItem: { callId: "call_s" },
+      output: "ignored",
+    }, ctx);
+    expect(out).toEqual([]);
+    expect(ctx.stateToolCallIds.has("call_s")).toBe(false);
+  });
+});
+
+describe("handlers — message snapshot merging (Phase 4)", () => {
+  it("accumulates assistant text into ctx.messages on close", () => {
+    const ctx = new StreamContext("run-1");
+    handleRawModelStreamEvent({ type: "output_text_delta", delta: "Hello " }, ctx);
+    handleRawModelStreamEvent({ type: "output_text_delta", delta: "world" }, ctx);
+    closeOpenBlocks(ctx);
+    expect(ctx.messages).toHaveLength(1);
+    expect(ctx.messages[0]).toMatchObject({ role: "assistant", content: "Hello world" });
+  });
+
+  it("accumulates a tool call onto the assistant message + a tool result message", () => {
+    const ctx = new StreamContext("run-1");
+    handleRunItemStreamEvent("tool_called", {
+      rawItem: { callId: "c1", name: "get_weather", arguments: '{"city":"SF"}' },
+    }, ctx);
+    handleRunItemStreamEvent("tool_output", {
+      rawItem: { callId: "c1", name: "get_weather" },
+      output: "sunny",
+    }, ctx);
+    closeOpenBlocks(ctx);
+
+    // One assistant message carrying the tool call, one tool result message.
+    const roles = ctx.messages.map((m) => m.role);
+    expect(roles).toContain("assistant");
+    expect(roles).toContain("tool");
+
+    const assistant = ctx.messages.find((m) => m.role === "assistant") as any;
+    expect(assistant.toolCalls).toEqual([
+      { id: "c1", type: "function", function: { name: "get_weather", arguments: '{"city":"SF"}' } },
+    ]);
+
+    const tool = ctx.messages.find((m) => m.role === "tool") as any;
+    expect(tool).toMatchObject({ id: "c1", role: "tool", toolCallId: "c1", content: "sunny" });
+  });
+
+  it("merges accumulated messages into buildMessagesSnapshot", () => {
+    const ctx = new StreamContext("run-1");
+    handleRawModelStreamEvent({ type: "output_text_delta", delta: "hi" }, ctx);
+    closeOpenBlocks(ctx);
+
+    const input = [{ id: "u1", role: "user", content: "hello" }] as any;
+    const out = buildMessagesSnapshot(input, ctx.messages);
+    expect(out).toHaveLength(2);
+    expect(out[0].id).toBe("u1");
+    expect(out[1]).toMatchObject({ role: "assistant", content: "hi" });
+  });
+
+  it("does not accumulate the state tool as an assistant tool call", () => {
+    const ctx = new StreamContext("run-1", { count: 0 });
+    handleRunItemStreamEvent("tool_called", {
+      rawItem: {
+        callId: "call_s",
+        name: STATE_MANAGEMENT_TOOL_NAME,
+        arguments: JSON.stringify({ state: { count: 1 } }),
+      },
+    }, ctx);
+    handleRunItemStreamEvent("tool_output", {
+      rawItem: { callId: "call_s" },
+      output: "ignored",
+    }, ctx);
+    closeOpenBlocks(ctx);
+    // No assistant message (no text, no forwarded tool call) and no tool message.
+    expect(ctx.messages).toEqual([]);
   });
 });

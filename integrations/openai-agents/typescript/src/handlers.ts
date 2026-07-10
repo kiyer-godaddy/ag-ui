@@ -12,11 +12,27 @@ import type {
   Message,
 } from "@ag-ui/core";
 
+import { STATE_MANAGEMENT_TOOL_NAME } from "./config";
 import { outputToString } from "./utils";
+
+/** An AG-UI tool-call entry attached to an assistant message (OpenAI shape). */
+interface AssistantToolCall {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+}
+
+/** In-flight assistant message being accumulated for MESSAGES_SNAPSHOT. */
+interface PendingAssistant {
+  id: string;
+  content: string;
+  toolCalls: AssistantToolCall[];
+}
 
 /**
  * Per-run mutable state shared across handlers. Tracks which message / tool
- * call / reasoning block is currently open so deltas attach to the right IDs.
+ * call / reasoning block is currently open so deltas attach to the right IDs,
+ * and accumulates the state + messages produced during the run.
  */
 export class StreamContext {
   /** AG-UI message id for the currently-streaming assistant text message, if any. */
@@ -38,10 +54,85 @@ export class StreamContext {
   /** toolCallId → tool name, captured when the call item is first seen. */
   readonly toolCallNames = new Map<string, string>();
 
+  /** toolCallIds produced by the state-management tool (intercepted, not forwarded). */
+  readonly stateToolCallIds = new Set<string>();
+
+  /** Shared application state, seeded from `input.state` and evolved as the
+   *  model calls `ag_ui_update_state` (replace semantics). */
+  currentState: unknown;
+
+  /** Messages produced during this run, merged into the MESSAGES_SNAPSHOT. */
+  readonly messages: Message[] = [];
+
+  /** Assistant message being accumulated (text + tool calls), flushed on close. */
+  private pendingAssistant: PendingAssistant | null = null;
+
   constructor(
     /** Base id used to derive message ids when the SDK provides none. */
     public readonly runId: string,
-  ) {}
+    initialState?: unknown,
+  ) {
+    this.currentState = initialState ?? null;
+  }
+
+  /**
+   * Ensure an in-flight assistant message exists (lazily created with the
+   * current message id) and return it so handlers can append content / calls.
+   */
+  private ensurePendingAssistant(): PendingAssistant {
+    if (!this.pendingAssistant) {
+      this.pendingAssistant = {
+        id: this.currentMessageId ?? this.runId,
+        content: "",
+        toolCalls: [],
+      };
+    }
+    return this.pendingAssistant;
+  }
+
+  /** Append streamed assistant text to the pending message. */
+  appendAssistantText(delta: string): void {
+    this.ensurePendingAssistant().content += delta;
+  }
+
+  /** Attach a (non-state) tool call to the pending assistant message. */
+  recordAssistantToolCall(
+    callId: string,
+    name: string,
+    args: string,
+  ): void {
+    this.ensurePendingAssistant().toolCalls.push({
+      id: callId,
+      type: "function",
+      function: { name, arguments: args },
+    });
+  }
+
+  /**
+   * Flush the pending assistant message (if it has content or tool calls) into
+   * `messages`, upserting by id so late-arriving tool calls merge in. Called at
+   * end-of-stream and when a tool result closes a tool call.
+   */
+  flushPendingAssistant(): void {
+    if (!this.pendingAssistant) return;
+    const p = this.pendingAssistant;
+    if (p.content || p.toolCalls.length > 0) {
+      this.upsertMessage({
+        id: p.id,
+        role: "assistant",
+        ...(p.content ? { content: p.content } : {}),
+        ...(p.toolCalls.length > 0 ? { toolCalls: p.toolCalls } : {}),
+      } as Message);
+    }
+    this.pendingAssistant = null;
+  }
+
+  /** Insert-or-replace a message in `messages` by id. */
+  upsertMessage(msg: Message): void {
+    const idx = this.messages.findIndex((m) => m.id === msg.id);
+    if (idx !== -1) this.messages[idx] = msg;
+    else this.messages.push(msg);
+  }
 }
 
 /* ----------------------------- raw model events ---------------------------- */
@@ -121,6 +212,7 @@ export function handleRawModelStreamEvent(
       messageId: ctx.currentMessageId!,
       delta: data.delta,
     });
+    ctx.appendAssistantText(data.delta);
     return events;
   }
 
@@ -265,9 +357,29 @@ function handleToolCalled(item: any, ctx: StreamContext): BaseEvent[] {
 
   if (toolName) ctx.toolCallNames.set(callId, toolName);
 
+  // Intercept the state-management tool: the model passes the complete updated
+  // state in the `state` arg; we emit a STATE_SNAPSHOT (replace semantics) and
+  // do NOT surface it as a frontend tool call. (Phase 4.)
+  if (toolName === STATE_MANAGEMENT_TOOL_NAME) {
+    ctx.stateToolCallIds.add(callId);
+    const argsStr =
+      ctx.toolCallArgs.get(callId) ??
+      (typeof raw.arguments === "string" ? raw.arguments : "");
+    ctx.toolCallArgs.delete(callId);
+    const updated = applyStateUpdate(ctx, argsStr, events);
+    if (updated !== undefined) ctx.currentState = updated;
+    return events;
+  }
+
   // If args streamed before the item, emit them now as a single ARGS delta.
   const buffered = ctx.toolCallArgs.get(callId);
   ctx.openToolCalls.add(callId);
+
+  const effectiveArgs =
+    buffered ??
+    (typeof raw.arguments === "string" && raw.arguments.length > 0
+      ? raw.arguments
+      : "");
 
   events.push({
     type: EventType.TOOL_CALL_START,
@@ -275,18 +387,11 @@ function handleToolCalled(item: any, ctx: StreamContext): BaseEvent[] {
     toolCallName: toolName ?? "tool",
   });
 
-  if (buffered) {
+  if (effectiveArgs) {
     events.push({
       type: EventType.TOOL_CALL_ARGS,
       toolCallId: callId,
-      delta: buffered,
-    });
-  } else if (typeof raw.arguments === "string" && raw.arguments.length > 0) {
-    // No streamed deltas — emit the full args as one delta.
-    events.push({
-      type: EventType.TOOL_CALL_ARGS,
-      toolCallId: callId,
-      delta: raw.arguments,
+      delta: effectiveArgs,
     });
   }
 
@@ -294,6 +399,9 @@ function handleToolCalled(item: any, ctx: StreamContext): BaseEvent[] {
     type: EventType.TOOL_CALL_END,
     toolCallId: callId,
   });
+
+  // Record the call against the assistant message for MESSAGES_SNAPSHOT. (Phase 4.)
+  ctx.recordAssistantToolCall(callId, toolName ?? "tool", effectiveArgs);
   return events;
 }
 
@@ -301,18 +409,84 @@ function handleToolOutput(item: any, ctx: StreamContext): BaseEvent[] {
   const raw = item?.rawItem;
   const callId: string | undefined = raw?.callId ?? raw?.call_id;
   if (!callId) return [];
+
+  // The state-management tool is intercepted; its stub execute still yields a
+  // tool_output run_item, but we never emitted TOOL_CALL_START for it, so
+  // swallow the result rather than emit a dangling TOOL_CALL_RESULT. (Phase 4.)
+  if (ctx.stateToolCallIds.has(callId)) {
+    ctx.stateToolCallIds.delete(callId);
+    return [];
+  }
+
   ctx.openToolCalls.delete(callId);
   ctx.toolCallArgs.delete(callId);
   ctx.toolCallNames.delete(callId);
+
+  const content = outputToString(item?.output ?? raw?.output ?? "");
+
+  // Record the tool result message for MESSAGES_SNAPSHOT. (Phase 4.)
+  ctx.upsertMessage({
+    id: callId,
+    role: "tool",
+    toolCallId: callId,
+    content,
+  } as Message);
+
+  // Any assistant text + calls preceding this result are now complete.
+  ctx.flushPendingAssistant();
+
   return [
     {
       type: EventType.TOOL_CALL_RESULT,
       messageId: callId,
       toolCallId: callId,
-      content: outputToString(item?.output ?? raw?.output ?? ""),
+      content,
       role: "tool",
     },
   ];
+}
+
+/**
+ * Parse the `ag_ui_update_state` arguments and, when the new state differs from
+ * the current one, push a `STATE_SNAPSHOT` event into `events`. Returns the new
+ * state (or `undefined` to leave it unchanged) so the caller can update ctx.
+ *
+ * State-merge semantics: **replace** — the model passes the complete updated
+ * state object in the `state` field (matches the tool description and the
+ * `tools.test.ts` "replace vs. patch" pin).
+ */
+function applyStateUpdate(
+  ctx: StreamContext,
+  argsStr: string,
+  events: BaseEvent[],
+): unknown | undefined {
+  if (!argsStr) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(argsStr);
+  } catch {
+    events.push({
+      type: EventType.CUSTOM,
+      name: "state_update_error",
+      value: { error: "Failed to parse ag_ui_update_state arguments" },
+    });
+    return undefined;
+  }
+
+  // The tool schema declares a required `state` object; accept it directly.
+  // Be lenient: a bare object passed without the wrapper is also accepted.
+  const newState =
+    parsed && typeof parsed === "object" && "state" in (parsed as Record<string, unknown>)
+      ? (parsed as Record<string, unknown>).state
+      : parsed;
+
+  if (JSON.stringify(newState) === JSON.stringify(ctx.currentState)) return undefined;
+
+  events.push({
+    type: EventType.STATE_SNAPSHOT,
+    snapshot: newState,
+  });
+  return newState;
 }
 
 function handleReasoningItemCreated(item: any, ctx: StreamContext): BaseEvent[] {
@@ -373,20 +547,22 @@ export function closeOpenBlocks(ctx: StreamContext): BaseEvent[] {
     });
     ctx.reasoningOpen = false;
   }
+  // Flush any accumulated assistant message into the snapshot. (Phase 4.)
+  ctx.flushPendingAssistant();
   return events;
 }
 
 /**
  * Build the MESSAGES_SNAPSHOT payload from the input messages plus any
- * assistant messages produced during the run.
+ * assistant / tool messages accumulated from the stream during this run.
  *
- * Phase 2 returns the input messages as-is; Phase 4 will merge in generated
- * assistant / tool messages accumulated from the stream. The signature accepts
- * accumulated messages so later phases can extend it without changing callers.
+ * Phase 4 merges in the generated messages (assistant text + tool calls +
+ * tool results) tracked on the `StreamContext`. The signature accepts the
+ * accumulated list so the adapter can pass `ctx.messages`.
  */
 export function buildMessagesSnapshot(
   inputMessages: Message[],
-  _accumulated: Message[] = [],
+  accumulated: Message[] = [],
 ): Message[] {
-  return [...inputMessages, ..._accumulated];
+  return [...inputMessages, ...accumulated];
 }

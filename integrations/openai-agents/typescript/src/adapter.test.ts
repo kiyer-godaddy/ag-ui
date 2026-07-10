@@ -184,6 +184,110 @@ describe("OpenAIAgentsAdapter — run lifecycle", () => {
     expect(result.toolCallId).toBe("c1");
   });
 
+  it("emits an initial STATE_SNAPSHOT with input.state when state is present", async () => {
+    eventsRef.events = [];
+    process.env.OPENAI_API_KEY = "sk-test";
+
+    const adapter = new OpenAIAgentsAdapter({ model: "gpt-5" });
+    const events = await collectEvents(
+      adapter,
+      baseInput({ state: { theme: "dark" } }),
+    );
+
+    const snapshot = events.find((e) => e.type === EventType.STATE_SNAPSHOT) as any;
+    expect(snapshot).toBeDefined();
+    expect(snapshot.snapshot).toEqual({ theme: "dark" });
+    // Initial snapshot comes right after RUN_STARTED.
+    const types = events.map((e) => e.type);
+    expect(types.indexOf(EventType.STATE_SNAPSHOT)).toBeGreaterThan(
+      types.indexOf(EventType.RUN_STARTED),
+    );
+  });
+
+  it("does not emit an initial STATE_SNAPSHOT when state is null", async () => {
+    eventsRef.events = [];
+    process.env.OPENAI_API_KEY = "sk-test";
+
+    const adapter = new OpenAIAgentsAdapter({ model: "gpt-5" });
+    const events = await collectEvents(adapter, baseInput({ state: null }));
+
+    expect(events.some((e) => e.type === EventType.STATE_SNAPSHOT)).toBe(false);
+  });
+
+  it("intercepts ag_ui_update_state and emits an updated STATE_SNAPSHOT (replace)", async () => {
+    eventsRef.events = [
+      {
+        type: "run_item_stream_event",
+        name: "tool_called",
+        item: {
+          rawItem: {
+            callId: "call_s",
+            name: "ag_ui_update_state",
+            arguments: JSON.stringify({ state: { count: 7 } }),
+          },
+        },
+      },
+      {
+        type: "run_item_stream_event",
+        name: "tool_output",
+        item: { rawItem: { callId: "call_s" }, output: "ok" },
+      },
+    ];
+    process.env.OPENAI_API_KEY = "sk-test";
+
+    const adapter = new OpenAIAgentsAdapter({ model: "gpt-5" });
+    const events = await collectEvents(
+      adapter,
+      baseInput({ state: { count: 0 } }),
+    );
+
+    const snapshots = events.filter((e) => e.type === EventType.STATE_SNAPSHOT) as any[];
+    // Initial snapshot ({count:0}) + updated snapshot ({count:7}).
+    expect(snapshots).toHaveLength(2);
+    expect(snapshots[0].snapshot).toEqual({ count: 0 });
+    expect(snapshots[1].snapshot).toEqual({ count: 7 });
+
+    // The state tool is never surfaced as a frontend tool call.
+    expect(events.some((e) => e.type === EventType.TOOL_CALL_START)).toBe(false);
+    expect(events.some((e) => e.type === EventType.TOOL_CALL_RESULT)).toBe(false);
+  });
+
+  it("merges generated assistant + tool messages into MESSAGES_SNAPSHOT", async () => {
+    eventsRef.events = [
+      { type: "raw_model_stream_event", data: { type: "output_text_delta", delta: "Sure" } },
+      { type: "run_item_stream_event", name: "message_output_created", item: { rawItem: {} } },
+      {
+        type: "run_item_stream_event",
+        name: "tool_called",
+        item: { rawItem: { callId: "c9", name: "lookup", arguments: '{"q":"x"}' } },
+      },
+      {
+        type: "run_item_stream_event",
+        name: "tool_output",
+        item: { rawItem: { callId: "c9", name: "lookup" }, output: "found" },
+      },
+    ];
+    process.env.OPENAI_API_KEY = "sk-test";
+
+    const adapter = new OpenAIAgentsAdapter({ model: "gpt-5" });
+    const events = await collectEvents(
+      adapter,
+      baseInput({
+        messages: [{ id: "u1", role: "user", content: "hi" } as any],
+        state: null,
+      }),
+    );
+
+    const snap = events.find((e) => e.type === EventType.MESSAGES_SNAPSHOT) as any;
+    expect(snap).toBeDefined();
+    const ids = snap.messages.map((m: any) => m.id);
+    expect(ids).toContain("u1"); // input message preserved
+    expect(ids).toContain("c9"); // tool result message
+    const assistant = snap.messages.find((m: any) => m.role === "assistant");
+    expect(assistant).toBeDefined();
+    expect(assistant.content).toBe("Sure");
+  });
+
   it("emits RUN_ERROR when the SDK run throws", async () => {
     eventsRef.throwErr = new Error("boom");
     process.env.OPENAI_API_KEY = "sk-test";

@@ -20,6 +20,7 @@ import type { BaseEvent, RunAgentInput } from "@ag-ui/core";
 
 import { DEFAULT_MODEL, ENV, STATE_MANAGEMENT_TOOL_NAME } from "./config";
 import type { OpenAIAgentsAdapterConfig, ProcessedEvent } from "./types";
+import { hasState } from "./state";
 import { messagesToSdkInput, outputToString } from "./utils";
 import {
   StreamContext,
@@ -228,7 +229,7 @@ export class OpenAIAgentsAdapter extends AbstractAgent {
     const agent = this.buildAgent(mod, input);
     const sdkInput = messagesToSdkInput(input.messages ?? []);
 
-    const ctx = new StreamContext(runId);
+    const ctx = new StreamContext(runId, input.state);
 
     try {
       if (input.parentRunId) {
@@ -244,6 +245,15 @@ export class OpenAIAgentsAdapter extends AbstractAgent {
         ...(input.parentRunId ? { parentRunId: input.parentRunId } : {}),
       });
 
+      // Announce the initial shared state so the frontend can hydrate. Mirrors
+      // the claude-agent-sdk behaviour: only emit when state is meaningful.
+      if (hasState(input.state)) {
+        subscriber.next({
+          type: EventType.STATE_SNAPSHOT,
+          snapshot: input.state,
+        });
+      }
+
       const stream = (await mod.run(agent, sdkInput, { stream: true })) as AsyncIterable<any>;
 
       for await (const ev of stream) {
@@ -257,7 +267,7 @@ export class OpenAIAgentsAdapter extends AbstractAgent {
 
       subscriber.next({
         type: EventType.MESSAGES_SNAPSHOT,
-        messages: buildMessagesSnapshot(input.messages ?? []),
+        messages: buildMessagesSnapshot(input.messages ?? [], ctx.messages),
       });
 
       subscriber.next({
