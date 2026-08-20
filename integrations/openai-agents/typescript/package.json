@@ -24,7 +24,7 @@
     "dev": "tsup --watch",
     "dev:examples": "tsx --env-file=.env --watch examples/server.ts",
     "clean": "rm -rf dist .turbo node_modules",
-    "typecheck": "tsc --noEmit",
+    "check-types": "tsc --noEmit",
     "test": "vitest run",
     "link:global": "pnpm link --global",
     "unlink:global": "pnpm unlink --global"

@@ -378,6 +378,17 @@ export const menuIntegrations = [
     ],
   },
   {
+    id: "openai-agents-typescript",
+    name: "OpenAI Agents SDK (TypeScript)",
+    features: [
+      "agentic_chat",
+      "backend_tool_rendering",
+      "shared_state",
+      "human_in_the_loop",
+      "tool_based_generative_ui",
+    ],
+  },
+  {
     id: "langroid",
     name: "Langroid",
     features: [

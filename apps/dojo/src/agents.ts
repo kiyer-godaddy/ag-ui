@@ -660,6 +660,21 @@ export const agentsIntegrations = {
       },
     ),
 
+  "openai-agents-typescript": async () =>
+    mapAgents(
+      (path) =>
+        new HttpAgent({
+          url: `${envVars.openaiAgentsTypescriptUrl}/${path}`,
+        }),
+      {
+        agentic_chat: "agentic_chat",
+        backend_tool_rendering: "backend_tool_rendering",
+        shared_state: "shared_state",
+        human_in_the_loop: "human_in_the_loop",
+        tool_based_generative_ui: "tool_based_generative_ui",
+      },
+    ),
+
   langroid: async () =>
     mapAgents(
       (path) =>
