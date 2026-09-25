@@ -160,6 +160,11 @@ const ALL_TARGETS = {
     name: "Claude Managed Agents (TypeScript)",
     cwd: path.join(integrationsRoot, "claude-managed-agents/typescript"),
   },
+  "openai-agents-typescript": {
+    command: "pnpm install",
+    name: "OpenAI Agents SDK (TypeScript)",
+    cwd: path.join(integrationsRoot, "openai-agents/typescript"),
+  },
   "microsoft-agent-framework-python": {
     command: "uv sync",
     name: "Microsoft Agent Framework (Python)",

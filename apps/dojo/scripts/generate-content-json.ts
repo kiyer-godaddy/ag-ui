@@ -567,6 +567,26 @@ const agentFilesMapper: Record<
       {},
     );
   },
+  "openai-agents-typescript": (agentKeys: string[]) => {
+    return agentKeys.reduce(
+      (acc, agentId) => ({
+        ...acc,
+        [agentId]: [
+          path.join(
+            __dirname,
+            integrationsFolderPath,
+            `/openai-agents/typescript/examples/${agentId}.ts`,
+          ),
+          path.join(
+            __dirname,
+            integrationsFolderPath,
+            `/openai-agents/typescript/examples/server.ts`,
+          ),
+        ],
+      }),
+      {},
+    );
+  },
   // claude-managed-agents serves every feature from one server per language,
   // driven by the shared agent specs.
   "claude-managed-agents-dotnet": (agentKeys: string[]) => {
