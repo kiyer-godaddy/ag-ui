@@ -306,6 +306,22 @@ const ALL_SERVICES = {
       },
     },
   ],
+  "openai-agents-typescript": [
+    {
+      command: "npx tsx examples/server.ts",
+      name: "OpenAI Agents SDK (TypeScript)",
+      cwd: path.join(integrationsRoot, "openai-agents/typescript"),
+      env: {
+        PORT: 8024,
+        OPENAI_API_KEY:
+          process.env.OPENAI_API_KEY ||
+          "sk-test-key-for-llmock-00000000000000000000000000000000000000000000000000000000",
+        ...(!process.env.OPENAI_API_KEY && {
+          OPENAI_BASE_URL: "http://localhost:5555/v1",
+        }),
+      },
+    },
+  ],
   "microsoft-agent-framework-python": [
     {
       command: "uv run dev",
@@ -371,6 +387,7 @@ const ALL_SERVICES = {
         CLAUDE_MANAGED_AGENTS_DOTNET_URL: "http://localhost:8026",
         CLAUDE_MANAGED_AGENTS_PYTHON_URL: "http://localhost:8025",
         CLAUDE_MANAGED_AGENTS_TYPESCRIPT_URL: "http://localhost:8024",
+        OPENAI_AGENTS_TYPESCRIPT_URL: "http://localhost:8024",
         LANGROID_URL: "http://localhost:8021",
         NEXT_PUBLIC_CUSTOM_DOMAIN_TITLE:
           "cpkdojo.local___CopilotKit Feature Viewer",
@@ -410,6 +427,7 @@ const ALL_SERVICES = {
         CLAUDE_MANAGED_AGENTS_DOTNET_URL: "http://localhost:8026",
         CLAUDE_MANAGED_AGENTS_PYTHON_URL: "http://localhost:8025",
         CLAUDE_MANAGED_AGENTS_TYPESCRIPT_URL: "http://localhost:8024",
+        OPENAI_AGENTS_TYPESCRIPT_URL: "http://localhost:8024",
         LANGROID_URL: "http://localhost:8021",
         NEXT_PUBLIC_CUSTOM_DOMAIN_TITLE:
           "cpkdojo.local___CopilotKit Feature Viewer",
